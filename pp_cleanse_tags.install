@@ -1,0 +1,10 @@
+<?php
+
+/**
+ * Implements hook_uninstall().
+ */
+function pp_cleanse_tags_uninstall() {
+
+  variable_del('pp_cleanse_tags_start_index');
+  variable_del('pp_cleanse_tags_number_to_do');	
+}

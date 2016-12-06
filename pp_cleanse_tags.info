@@ -1,0 +1,7 @@
+name = Power Poetry Cleanse Tags
+description = Special high-octane code to fix the tags that are munged together.
+core = "7.x"
+package = Power Poetry
+
+version = "7.x-1.0"
+configure = admin/config/power-poetry/pp-cleanse-tags

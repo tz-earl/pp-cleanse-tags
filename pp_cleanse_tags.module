@@ -1,0 +1,559 @@
+<?php
+
+/**
+ * @file
+ * Module to clean up and fix the tags of poems in large batches.
+ *
+ * The issue is that in the Power Poetry collection of poems, many tags as currently stored
+ * actually consist of more than one tag and should be broken up. For example, an existing
+ * tag might have a value of "#love #family #siblings" that really should be the three
+ * separate tags of "love", "family", and "siblings".
+ *
+ * What brought this about is that users often use the pound sign # as a tag delimiter,
+ * not knowing that by default Drupal 7 uses the comma. The processing of the tags form
+ * field has not made any attempt to correct this.
+ *
+ * However, as part of this project, a snippet of javascript is now used to replace each
+ * pound sign # with a comma. See function pp_cleanse_tags_form_poem_node_form_alter() below.
+ *
+ * That still leaves a set of more than 200,000 poems many of which have incorrect tags and
+ * therefore are not amenable to good search results based on tag searches. Hence, the
+ * main purpose of this module is to fix all those.
+ *
+ * This module consists of three parts.
+ *
+ * (1) The implementation of hook_menu() provides a form where an admin user can clean up
+ * a batch of poems. A batch is defined by a starting order number and a batch size.
+ * For example, the user can process a batch that starts at order number 0 and has a size
+ * of 5000. A second batch could then start at order number 5000 and have a size of 4000,
+ * a third batch at order number 9000 and batch size of 5000, and so forth.
+ *
+ * It so happens that the database query orders the results by node id, but a different
+ * ordering could be used as long as it is consistent from batch to batch.
+ *
+ * (2) The implementation of hook_menu() provides another form where an admin user can
+ * delete unused tags. Many tags become unused as a result of being replaced by "sub-tags"
+ * that are extracted out of them. Deleting of unused tags helps with having them not show
+ * up in auto-completion for searches.
+ *
+ * (3) An implementation of hook_form_FORM_ID_alter() attaches a javascript snippet to the
+ * tags form field that replaces each pound sign with a comma for proper parsing of the tags.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function pp_cleanse_tags_menu() {
+
+  $items['admin/config/power-poetry/pp-cleanse-tags'] = array(
+    'title' => 'Power Poetry cleanse tags - Fix Tags',
+    'description' => 'For each poem in a specified batch,' .
+                    ' fix all the tags that are run together into one large tag value.',
+    'type' => MENU_NORMAL_ITEM,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('pp_cleanse_tags_settings'),
+    'access arguments' => array('administer site configuration'),
+  );
+  $items['admin/config/power-poetry/pp-cleanse-tags-remove-unused'] = array(
+    'title' => 'Power Poetry cleanse tags - Remove Unused Tags',
+    'description' => 'Remove unused tags from the Tags vocabulary.',
+    'type' => MENU_NORMAL_ITEM,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('pp_cleanse_tags_remove_unused_settings'),
+    'access arguments' => array('administer site configuration'),
+  );
+  return $items;
+};
+
+/**
+ * Callback to build the module's fix-tags page.
+ */
+function pp_cleanse_tags_settings($form, &$form_state) {
+
+  $form = array();
+
+  $form['power_poetry_cleanse_tags'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Cleanse Tags'),
+    '#description' =>
+      t('Using the Starting index as the beginning of a batch of poems retrieved from the database, ' .
+        'fix all the tags that are run together into one tag value.<br />' .
+        'This will create new tags to replace the old ones.<br /><br />' .
+        'However, the old tags will still be in the "tags" vocabulary. ' .
+        'Remove obsoleted, unused tags at the ' .
+        '<a href="/admin/config/power-poetry/pp-cleanse-tags-remove-unused">' .
+        'Remove Unused Tags</a> page.<br /><br />' .
+        'Back up the database first!!<br /><br />'),
+  );
+
+  $start_index = variable_get('pp_cleanse_tags_start_index', '');
+  $form['power_poetry_cleanse_tags']['start_index'] = array(
+    '#type' => 'textfield',
+    '#size' => 12,
+    '#maxlength' => 6,
+    '#required' => TRUE,
+    '#title' => 'Starting batch index',
+    '#default_value' => $start_index,
+    '#element_validate' => array('_pp_cleanse_tags_validate_number'),
+  );
+
+  $number_to_do = variable_get('pp_cleanse_tags_number_to_do', '');
+  $form['power_poetry_cleanse_tags']['number_to_do'] = array(
+    '#type' => 'textfield',
+    '#size' => 12,
+    '#maxlength' => 6,
+    '#required' => TRUE,
+    '#title' => 'Number to process',
+    '#default_value' => $number_to_do,
+    '#element_validate' => array('_pp_cleanse_tags_validate_number'),
+  );
+
+  $form['power_poetry_cleanse_tags']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Fix Tags'),
+  );
+
+  $form['power_poetry_cleanse_tags']['cancel'] = array(
+    '#markup' => l(t('Cancel'), 'admin/modules'),
+  );
+
+  return $form;
+}
+
+/**
+ * Check that the value of a form element consists only of decimal digits.
+ */
+function _pp_cleanse_tags_validate_number($element, &$form_state, $form) {
+
+  $value = trim($element['#value']);
+  if (!preg_match('/^\d+$/', $value)) {
+    form_error($element, 'Must be a positive integer.');
+    return;
+  }
+}
+
+/**
+ * Callback to submit the fix-tags page.
+ */
+function pp_cleanse_tags_settings_submit($form, &$form_state) {
+
+  // Show start time.
+  $date_format = 'j-M-Y @ H:i';  // E.g. 19-Feb-2015 @ 22:54
+  $start_time = date($date_format);
+  $msg = "Cleansing of tags started at {$start_time}.";
+  watchdog('PP Cleanse Tags', $msg);
+  drupal_set_message($msg);
+
+  // Let's roll.
+  $start_index = intval($form_state['values']['start_index']);
+  variable_set('pp_cleanse_tags_start_index', $start_index);
+
+  $number_to_do = intval($form_state['values']['number_to_do']);
+  variable_set('pp_cleanse_tags_number_to_do', $number_to_do);
+
+  _pp_cleanse_tags_fix_all($start_index, $number_to_do);
+
+  // Show stop time.
+  $stop_time =  date($date_format);
+  $msg = "Cleansing of tags completed at {$stop_time}.";
+  watchdog('PP Cleanse Tags', $msg);
+  drupal_set_message($msg);
+}
+
+/**
+ * The top-level routine that is called to process the user-requested batch of poems.
+ *
+ * @param int $start
+ *   The beginning order number of the poems to process, where the ordering is by node id.
+ *
+ * @param int $to_do
+ *   The size of the batch, i.e. the number of poems to process.
+ */
+function _pp_cleanse_tags_fix_all($start, $to_do) {
+
+  $msg = "Starting batch index: {$start}. Total number to process: {$to_do}.";
+  watchdog('PP Cleanse Tags', $msg);
+  drupal_set_message($msg);
+
+  $sql = "SELECT node.nid  FROM {node}
+          WHERE node.type = 'poem'
+          ORDER BY node.nid";
+
+  $poems_with_tags = $poems_no_tags = $poems_processed = 0;
+
+  $stop = $start + $to_do;
+
+  // I'm using the term "bunch" internally in contrast to "batch" as a user-facing word,
+  // where a bunch is the range of rows to retrieve in each call to db_query_range().
+  $bunch_start = $start;
+  $bunch_size = 500;
+
+  // Loop through as many bunches as necessary.
+  do {
+    $bunch_cnt = 0;
+    $results = db_query_range($sql, $bunch_start, $bunch_size);
+
+    // Loop through the poems of this bunch.
+    foreach ($results as $row) {
+      $node = node_load($row->nid);
+      $bunch_cnt++;
+      $poems_processed++;
+
+      if (empty($node->field_tags)) {
+        $poems_no_tags++;
+      }
+      else {
+        $poems_with_tags++;
+
+        // Process the tags for this poem.
+        $lang = $node->language;
+        $tags = $node->field_tags[$lang];
+        // The "field_tags" property stores tags for the "Keywords/tags" field.
+
+        $clean_tags = _pp_cleanse_tags_do_one_poem($tags);
+
+        $node->field_tags[$lang] = $clean_tags;
+        node_save($node);
+      }
+
+      if ($poems_processed >= $to_do) {
+        break;
+      }
+    }
+
+    $bunch_start += $bunch_cnt;
+    set_time_limit(30);
+
+  } while ($bunch_start < $stop && $bunch_cnt > 0);
+
+  $msg = "Poems with tags: {$poems_with_tags}. " .
+          "Poems without tags: {$poems_no_tags}. " .
+          "Total actually processed: {$poems_processed}.";
+  watchdog('PP Cleanse Tags', $msg);
+  drupal_set_message($msg);
+}
+
+/**
+ * Cleanse the set of tags for one poem.
+ */
+function _pp_cleanse_tags_do_one_poem($tags) {
+
+  $clean_tags = array();
+
+  // Iterate through the existing tags of the poem and
+  // extract sub-tags using the # sign as a tag indicator.
+
+  foreach ($tags as $idx => $tag) {
+    $name = _pp_cleanse_tags_tag2name($tag);
+
+    if (strpos($name, '#') === FALSE) {
+      $clean_tags[] = $tag;
+      continue;
+    }
+
+    $derived_tags =  _pp_cleanse_tags_extract_tags($tag);
+
+    if (!empty($derived_tags)) {
+      $clean_tags = array_merge($clean_tags, $derived_tags);
+    }
+  }
+
+  // Remove any duplicates from the set of clean tags.
+  $clean_tags = _pp_cleanse_tags_remove_dup_tags($clean_tags);
+
+  return $clean_tags;
+}
+
+/**
+ * Given one existing tag, extract out multiple sub-tags
+ * using the # sign as separator.
+ *
+ * Extracted tags that are not already in the vocabulary
+ * also are added to the vocab.
+ */
+function _pp_cleanse_tags_extract_tags($tag) {
+
+  // Extract derived tags using #.
+  $name = _pp_cleanse_tags_tag2name($tag);
+  $derived_names = explode('#', $name);
+
+  // Trim off leading and trailing spaces.
+  foreach ($derived_names as $idx => $name) {
+    $derived_names[$idx] = trim($name);
+  }
+
+  // Discard empty tags.
+  foreach ($derived_names as $idx => $name) {
+    if (empty($name)) {
+      unset($derived_names[$idx]);
+    }
+  }
+
+  $vocab_id = _pp_cleanse_tags_get_vocab_id();
+
+  // Using the list of derived tag names, build the list
+  // of derived tags. Add derived tags to the "tags" vocabulary
+  // if not already present.
+  $derived_tags = array();
+
+  foreach ($derived_names as $name) {
+
+    $terms = taxonomy_get_term_by_name($name, 'tags');
+    $keys = array_keys($terms);
+    if (count($keys) > 0) {
+      // There may be more than one match on $name because the call
+      // to taxonomy_get_term_by_name() is not case-sensitive.
+      // Just use the first term found since case is not important to us.
+      $derived_tags[] = array('tid' => $keys[0]);
+    }
+    else {
+      // Not already in the vocab, so add it.
+      $new_term = new stdClass;
+      $new_term->name = $name;
+      $new_term->vid = $vocab_id;
+      $status = taxonomy_term_save($new_term);
+      if ($status == SAVED_NEW) {
+        $term_id = $new_term->tid;
+        $derived_tags[] = array('tid' => $term_id);
+      }
+      else {
+        $error = "New tag/term '{$name}' could not be saved.";
+        throw new Exception($error);
+      }
+    }
+  }
+
+  return $derived_tags;
+}
+
+/**
+ * Given a tag, extract the actual wording/name of the tag.
+ */
+function _pp_cleanse_tags_tag2name($tag) {
+
+  $term_id = $tag['tid'];
+  $term = taxonomy_term_load($term_id);
+  $name = $term->name;
+  return $name;
+}
+
+/**
+ * Get the id of the "tags" vocabulary.
+ */
+function _pp_cleanse_tags_get_vocab_id() {
+
+  static $tags_vocab = 'tags';
+  static $vocab_id = -1;
+
+  if ($vocab_id == -1) {
+    $vocab_names = taxonomy_vocabulary_get_names();
+
+    if (isset($vocab_names[$tags_vocab])) {
+      $vocab_id = $vocab_names[$tags_vocab]->vid;
+    }
+    else {
+      $error = "Vocabulary '{$tags_vocab}' was not found. " .
+               'Check that a vocab by that name exists.';
+      throw new Exception($error);
+    }
+  }
+
+  return $vocab_id;
+}
+
+/**
+ * Remove any duplicate tags.
+ *
+ * @return array
+ */
+function _pp_cleanse_tags_remove_dup_tags($tags) {
+
+  $term_ids = array();
+  foreach ($tags as $t) {
+    $term_ids[] = $t['tid'];
+  }
+
+  $term_ids = array_unique($term_ids);
+
+  $tags_no_dups = array();
+  foreach ($term_ids as $tid) {
+    $tags_no_dups[] = array('tid' => $tid);
+  }
+
+  return $tags_no_dups;
+}
+
+/**
+ * For debugging only.
+ */
+function _pp_cleanse_tags_show_tags($node, $tags) {
+
+  foreach ($tags as $t) {
+    $term_id = $t['tid'];
+
+    $term = taxonomy_term_load($term_id);
+    $name = $term->name;
+
+    drupal_set_message("{$node->nid}: {$node->title}: {$name}");
+  }
+}
+
+/**
+ * Callback to build the module's delete-unused-tags page.
+ */
+function pp_cleanse_tags_remove_unused_settings($form, &$form_state) {
+
+  $form = array();
+
+  $count = _pp_cleanse_tags_count_unused_tags();
+
+  $form['power_poetry_cleanse_tags'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Removed Unused Tags'),
+    '#description' =>
+      t('Remove unused tags in the specified batch size below.<br />' .
+        'This action should be done after ' .
+        '<a href="/admin/config/power-poetry/pp-cleanse-tags">Cleanse Tags</a> ' .
+        'in order to clear out obsoleted tags from the Tags vocabulary. ' .
+        'Only tags that are no longer used by any poem are deleted.<br /><br />' .
+        'There are currently @count unused tags in the Tags vocabulary.<br /><br />' .
+        'Back up the database first!!<br /><br />',
+        array('@count' => $count)),
+  );
+
+  $number_to_remove = variable_get('pp_cleanse_tags_number_to_remove', '');
+  $form['power_poetry_cleanse_tags']['number_to_remove'] = array(
+    '#type' => 'textfield',
+    '#size' => 12,
+    '#maxlength' => 6,
+    '#required' => TRUE,
+    '#title' => 'Number to remove',
+    '#default_value' => $number_to_remove,
+    '#element_validate' => array('_pp_cleanse_tags_validate_number'),
+  );
+
+  $form['power_poetry_cleanse_tags']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Remove Tags'),
+  );
+
+  $form['power_poetry_cleanse_tags']['cancel'] = array(
+    '#markup' => l(t('Cancel'), 'admin/modules'),
+  );
+
+  return $form;
+}
+
+/**
+ * Callback to submit the remove-tags page.
+ */
+function pp_cleanse_tags_remove_unused_settings_submit($form, &$form_state) {
+
+  // Show start time.
+  $date_format = 'j-M-Y @ H:i';  // E.g. 19-Feb-2015 @ 22:54
+  $start_time = date($date_format);
+  $msg = "Removing of unused tags started at {$start_time}.";
+  watchdog('PP Cleanse Tags', $msg);
+  drupal_set_message($msg);
+
+  // Let's roll.
+  $number_to_remove = intval($form_state['values']['number_to_remove']);
+  variable_set('pp_cleanse_tags_number_to_remove', $number_to_remove);
+
+  _pp_cleanse_tags_remove_tags($number_to_remove);
+
+  // Show stop time.
+  $stop_time =  date($date_format);
+  $msg = "Removing of unused tags completed at {$stop_time}.";
+  watchdog('PP Cleanse Tags', $msg);
+  drupal_set_message($msg);
+}
+
+/**
+ *
+ */
+function _pp_cleanse_tags_count_unused_tags() {
+
+  $count = 0;
+
+  $vocab_id = _pp_cleanse_tags_get_vocab_id();
+
+  $sql = "SELECT count(*) FROM {taxonomy_term_data} AS tdata
+            WHERE tdata.vid = {$vocab_id} AND
+            not exists (SELECT * FROM {taxonomy_index} AS tidx WHERE tidx.tid = tdata.tid)
+            ORDER BY tdata.tid";
+
+  $count = db_query($sql)->fetchField();
+
+  return $count;
+}
+
+/**
+ * Remove a batch of unused tags.
+ */
+function _pp_cleanse_tags_remove_tags($number_to_remove) {
+
+  $msg = "Number of tags to remove: {$number_to_remove}.";
+  watchdog('PP Cleanse Tags', $msg);
+  drupal_set_message($msg);
+
+  $vocab_id = _pp_cleanse_tags_get_vocab_id();
+
+  $sql = "SELECT tdata.tid, tdata.name FROM {taxonomy_term_data} AS tdata
+            WHERE tdata.vid = {$vocab_id} AND
+            not exists (SELECT * FROM {taxonomy_index} AS tidx WHERE tidx.tid = tdata.tid)
+            ORDER BY tdata.tid";
+
+  $tags_removed = 0;
+
+  // I'm using the term "bunch" internally in contrast to "batch" as a user-facing word,
+  // where a bunch is the range of rows to retrieve in each call to db_query_range().
+  $bunch_start = 0;
+  $bunch_size = 500;
+
+  // Loop through as many bunches as necessary.
+  do {
+    $bunch_cnt = 0;
+    $results = db_query_range($sql, $bunch_start, $bunch_size);
+
+    // Loop through the tags of this bunch.
+    foreach ($results as $row) {
+      $bunch_cnt++;
+      $tags_removed++;
+
+      if (function_exists('dpm')) {
+        dpm('Tid: ' . $row->tid . '  Name: ' . $row->name);
+      }
+
+      // Remove the tag.
+      $status = taxonomy_term_delete($row->tid);
+      if ($status != SAVED_DELETED) {
+        $error = "Unused tag '{$row->name}', tid '{$row->tid}' could not be deleted.";
+        throw new Exception($error);
+      }
+
+      if ($tags_removed >= $number_to_remove) {
+        break;
+      }
+    }
+
+    set_time_limit(30);
+
+  } while ($tags_removed < $number_to_remove && $bunch_cnt > 0);
+
+  $msg = "Total tags actually removed: {$tags_removed}.";
+  watchdog('PP Cleanse Tags', $msg);
+  drupal_set_message($msg);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * For the Tags form field, replace each # sign with a comma
+ * since Drupal core uses commas to separate multiple tags.
+ */
+function pp_cleanse_tags_form_poem_node_form_alter(&$form, &$form_state, $form_id) {
+
+  $filepath = drupal_get_path('module', 'pp_cleanse_tags') . '/striptags.js';
+  $form['#attached']['js'][] = $filepath;
+}
